@@ -1,0 +1,8 @@
+{
+  "terminal_path": "C:\\Program Files\\MetaTrader 5\\terminal64.exe",
+  "login": 12345678,
+  "password": "CHANGE_ME",
+  "server": "FTMO-Server",
+  "symbol": "XAUUSD",
+  "telegram": { "bot_token": "", "chat_id": "" }
+}

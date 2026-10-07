@@ -1,0 +1,13 @@
+# secrets: MT5 account credentials — never commit or sync this
+config.json
+
+# local runtime state
+journal/
+STOP
+
+# python artifacts
+__pycache__/
+*.pyc
+.venv/
+
+.DS_Store

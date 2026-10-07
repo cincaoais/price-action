@@ -1,0 +1,9 @@
+# gold-pa dependencies
+# Windows (live runner + everything):
+#   pip install -r requirements.txt
+# macOS dev box (backtesting only — MetaTrader5 is Windows-only):
+#   pip install pandas numpy pyarrow
+pandas>=2.0
+numpy>=1.26
+pyarrow>=14.0
+MetaTrader5>=5.0.45; sys_platform == "win32"
