@@ -40,7 +40,11 @@ WARMUP = 3000          # M15 bars fetched per cycle (~31 days) — state rebuild
 RISK = 0.003           # 0.3% per trade — FTMO-fit (MC worst-5% DD -9% < 10% rule)
 MAX_DAILY_LOSS = 0.02  # self-limit, half of FTMO's 5%
 MAX_TOTAL_DD = 0.06    # self-limit from challenge-start equity, vs FTMO 10%
-FRIDAY_FLAT_HOUR = 20  # UTC hour on Friday after which everything is flattened
+# Friday hour after which everything is flattened, in BAR time. Live bars are
+# FTMO server time (UTC+2 winter / UTC+3 summer), so 22 = 20:00 UTC winter,
+# 19:00 UTC summer (PLAN: ~20:00 UTC). On UTC data (--dry/--replay on
+# Dukascopy) 22 falls after gold's close, so it never fires there.
+FRIDAY_FLAT_HOUR = 22
 PAPER_START = 10_000.0             # dry-run starting equity
 PAPER_COMMISSION_PCT = 0.000014    # dry-run round-turn commission, FTMO metals style
 

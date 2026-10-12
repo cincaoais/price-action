@@ -10,6 +10,8 @@ Usage (from the project root, gold-pa/):
   python -m goldpa.backtest [data_dir] --split   # disjoint time windows
   python -m goldpa.backtest [data_dir] --wf      # walk-forward optimization
   python -m goldpa.backtest [data_dir] --mc      # Monte Carlo drawdown bootstrap
+  add --friday=H to any of the above: Friday flat from hour H in the data's clock
+                                      (Dukascopy = UTC; FTMO MT5 bars = server time)
 """
 import sys
 
@@ -34,7 +36,11 @@ def commission_of(pos: dict) -> float:
 
 
 def run(m15: pd.DataFrame, h4: pd.DataFrame, trade_from=None, p: P | None = None,
-        cache: dict | None = None) -> dict:
+        cache: dict | None = None, friday_flat: int | None = None) -> dict:
+    """friday_flat: hour, in the DATA's own clock, from which Friday is flat —
+    cancel pending, close the position at bar close, no new entries (mirrors
+    runner.blocked()). None = off: the default for the live warmup replay,
+    WFO and the dry self-check, so their results are unchanged."""
     p = p or P()
     if cache is None:
         cache = precompute(m15, h4)
@@ -60,7 +66,17 @@ def run(m15: pd.DataFrame, h4: pd.DataFrame, trade_from=None, p: P | None = None
         evs = ev_by_bar.get(i, [])
         act = st.advance(i, bar, evs, flat=sb.pos is None)
 
-        if act and act.kind == "place":
+        ts = m15.index[i]
+        blocked = friday_flat is not None and ts.weekday() == 4 and ts.hour >= friday_flat
+        if blocked:
+            sb.cancel_pending()
+            for ev in sb.force_close(i, float(bar["close"])):
+                pnl = ev["side"] * (ev["price"] - ev["entry"]) * ev["qty"] - commission_of(ev)
+                equity += pnl
+                trades.append({"i": ev["i"], "hi": ev["hi"], "pnl": pnl,
+                               "r": pnl / (abs(ev["entry"] - ev["stop"]) * ev["qty"])})
+
+        if act and act.kind == "place" and not blocked:
             dist = abs(act.entry - act.stop)
             target = pool_target(act.side, act.entry, dist, snaps[i], p)
             sb.place(act.side, act.entry, act.stop, target)
@@ -78,7 +94,8 @@ def run(m15: pd.DataFrame, h4: pd.DataFrame, trade_from=None, p: P | None = None
                 trades.append({"i": ev["i"], "hi": ev["hi"], "pnl": pnl, "r": r})
 
         # --- arm new setups from this bar's sweeps (after fills, as validated) ---
-        st.arm(i, bar, evs, may_arm=sb.pos is None and (trade_from is None or m15.index[i] >= trade_from))
+        st.arm(i, bar, evs, may_arm=sb.pos is None and not blocked
+               and (trade_from is None or m15.index[i] >= trade_from))
 
         pos = sb.pos
         unreal = pos["side"] * (bar["close"] - pos["entry"]) * pos["qty"] if pos else 0.0
@@ -139,9 +156,11 @@ if __name__ == "__main__":
         sys.exit(0)
 
     data_dir = next((a for a in sys.argv[1:] if not a.startswith("-")), "../M5/M5")
+    ff = next((int(a.split("=")[1]) for a in sys.argv if a.startswith("--friday=")), None)
     m15 = data.load_m15(data_dir)
     h4 = data.resample_h4(m15)
-    print(f"{data_dir}: {len(m15)} M15 bars  {m15.index[0]} -> {m15.index[-1]}")
+    print(f"{data_dir}: {len(m15)} M15 bars  {m15.index[0]} -> {m15.index[-1]}"
+          f"  friday_flat={ff}")
 
     if "--split" in sys.argv:
         wins = [("develop  2021-2023", "2021-01-01", "2024-01-01"),
@@ -153,7 +172,7 @@ if __name__ == "__main__":
             warm = str((pd.Timestamp(s) - pd.Timedelta(days=90)).date())
             m = m15.loc[warm:e]
             r = run(m, data.resample_h4(m15.loc[:e] if e else m15),
-                    trade_from=pd.Timestamp(s).tz_localize(tz))
+                    trade_from=pd.Timestamp(s).tz_localize(tz), friday_flat=ff)
             print(f"{name}{r['trades']:>7}  {r['win_rate']:>6.1%} {r['profit_factor']:>6.2f} "
                   f"{r['total_return']:>8.1%} {r['max_drawdown']:>7.1%} {r['sharpe']:>8.2f}")
         sys.exit(0)
@@ -172,11 +191,11 @@ if __name__ == "__main__":
             tc = precompute(train, data.resample_h4(m15.loc[:tr_e]))
             best, best_s = None, -9.9
             for cand in grid:   # pick params by train Sharpe (return per unit pain)
-                r = run(train, None, None, cand, cache=tc)
+                r = run(train, None, None, cand, cache=tc, friday_flat=ff)
                 if r["sharpe"] > best_s:
                     best_s, best = r["sharpe"], cand
             sc = precompute(test, data.resample_h4(m15.loc[:te_e]))
-            r = run(test, None, trade_from=f, p=best, cache=sc)
+            r = run(test, None, trade_from=f, p=best, cache=sc, friday_flat=ff)
             oos_r += [t["r"] for t in r["trades_list"]]
             tag = f"{best.confirm_within} {best.zone_valid} {best.rr} {'P' if best.pool else 'F'}"
             print(f"{str(f.date()):>10} {tag:>14} {best_s:>9.2f} {r['trades']:>6} "
@@ -190,7 +209,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if "--mc" in sys.argv:    # Monte Carlo: bootstrap trade R sequence, DD distribution
-        r = run(m15, h4)
+        r = run(m15, h4, friday_flat=ff)
         rs = np.array([t["r"] for t in r["trades_list"]])
         rng = np.random.default_rng(7)
         sims = rng.choice(rs, size=(1000, len(rs)), replace=True)
@@ -203,6 +222,6 @@ if __name__ == "__main__":
         print(f"final  median {np.median(finals):.1%}  P(loss) {(finals < 0).mean():.1%}")
         sys.exit(0)
 
-    r = run(m15, h4)
+    r = run(m15, h4, friday_flat=ff)
     print(f"trades {r['trades']}  win {r['win_rate']:.1%}  PF {r['profit_factor']:.2f}  "
           f"return {r['total_return']:.1%}  maxDD {r['max_drawdown']:.1%}  sharpe {r['sharpe']:.2f}")
