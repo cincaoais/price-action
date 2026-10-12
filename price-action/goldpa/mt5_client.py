@@ -4,7 +4,11 @@ function here needs a connected `mt5` handle from connect(cfg).
 
 Config keys (config.json): terminal_path, login, password, server, symbol.
 """
+import datetime as dt
+
 import pandas as pd
+
+MAGIC = 20261006   # tags this bot's orders — the account also holds other bots' history
 
 
 def connect(cfg: dict):
@@ -78,7 +82,7 @@ def place_limit(mt5, symbol: str, sp: dict, side: int, entry: float, sl: float,
         "price": round(entry, d), "sl": round(sl, d), "tp": round(tp, d),
         "type_time": mt5f.ORDER_TIME_GTC,
         "type_filling": sp["filling"],
-        "magic": 20261006, "comment": comment[:31],
+        "magic": MAGIC, "comment": comment[:31],
     }
     res = mt5.order_send(req)
     if res is None or res.retcode != mt5f.TRADE_RETCODE_DONE:
@@ -105,10 +109,28 @@ def equity(mt5) -> float:
     return float(mt5.account_info().equity)
 
 
-def deals(mt5, position_ticket: int) -> list:
-    """All deals of a (closed) position — real fill prices and PnL:
-    pnl = sum(profit + commission + swap) over the deals."""
-    return list(mt5.history_deals_get(position=position_ticket) or [])
+def closed_positions(mt5, symbol: str) -> list:
+    """This bot's fully closed positions on `symbol` from MT5 history:
+    [(position_id, deals sorted by time, opening order or None)].
+    Ownership is the ENTRY deal's magic — manual closes carry magic 0."""
+    # +2 days: history is queried in server time, which runs ahead of local/UTC
+    hist = mt5.history_deals_get(dt.datetime(2000, 1, 1),
+                                 dt.datetime.now() + dt.timedelta(days=2)) or ()
+    by_pos = {}
+    for d in hist:
+        if d.symbol == symbol and d.position_id:
+            by_pos.setdefault(d.position_id, []).append(d)
+    out = []
+    for pid, ds in by_pos.items():
+        ins = [d for d in ds if d.entry == mt5.DEAL_ENTRY_IN]
+        outs = [d for d in ds if d.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_OUT_BY)]
+        if not ins or ins[0].magic != MAGIC or not outs:
+            continue
+        if sum(d.volume for d in ins) - sum(d.volume for d in outs) > 1e-9:
+            continue                      # partially closed — still open
+        orders = mt5.history_orders_get(ticket=pid) or ()
+        out.append((pid, sorted(ds, key=lambda d: d.time_msc), orders[0] if orders else None))
+    return out
 
 
 def flatten(mt5, symbol: str, sp: dict) -> None:
@@ -123,7 +145,7 @@ def flatten(mt5, symbol: str, sp: dict) -> None:
             "volume": p.volume, "type": mt5f.ORDER_TYPE_SELL if p.type == 0 else mt5f.ORDER_TYPE_BUY,
             "position": p.ticket,
             "price": tick.bid if p.type == 0 else tick.ask,
-            "deviation": 50, "magic": 20261006, "comment": "gp-flatten",
+            "deviation": 50, "magic": MAGIC, "comment": "gp-flatten",
             "type_filling": sp["filling"],
         }
         res = mt5.order_send(req)

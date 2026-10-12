@@ -274,12 +274,7 @@ class Runner:
                 posl = mt5c.positions(self.mt5, self.symbol)
                 if posl:
                     self.pos_ticket = posl[0].ticket
-                    self.open_info.update({"ts": ts, "lots": posl[0].volume,
-                                           "entry": posl[0].price_open})
-                    st.on_filled()
-                    jwrite("fill", {"ts": ts, "ticket": self.pos_ticket,
-                                    "price": posl[0].price_open})
-                    self.tg("fill", f"FILLED {self.symbol} @ {posl[0].price_open}")
+                    st.on_filled()              # fill is journaled by record_broker_trades
                 else:
                     st.on_filled()
                     jwrite("warn", {"ts": ts, "why": "pending vanished unexplained"})
@@ -289,19 +284,61 @@ class Runner:
                 jwrite("cancel", {"ts": ts, "ticket": o.ticket, "why": "stale"})
         if self.pos_ticket:
             if not any(p.ticket == self.pos_ticket for p in mt5c.positions(self.mt5, self.symbol)):
-                self.record_live_close(ts, equity)
+                self.pos_ticket = None
+        self.record_broker_trades(equity)
 
-    def record_live_close(self, ts, equity) -> None:
-        ticket, info = self.pos_ticket, self.open_info or {}
-        self.pos_ticket = None
-        deals = mt5c.deals(self.mt5, ticket)
-        pnl = sum(d.profit + d.commission + d.swap for d in deals)
-        exit_price = deals[-1].price if deals else None
-        reason = deals[-1].comment if deals else ""
-        jwrite("close", {"ts": ts, "ticket": ticket, "equity": equity, "pnl": pnl})
-        twrite({**info, "closed": ts, "ticket": ticket, "exit_price": exit_price,
-                "pnl": pnl, "reason": reason, "mode": "live"})
-        self.tg("close", f"position closed, pnl {pnl:.2f}, equity {equity:.0f}")
+    def record_broker_trades(self, equity) -> None:
+        """Journal fills and closed trades from MT5 history, not process memory:
+        --once is a fresh process per bar, so memory can't carry a trade from
+        fill to close. Idempotent (keyed by position id), so a trade that
+        opens/closes while the PC is off is still recorded on the next run."""
+        mt5 = self.mt5
+        at = lambda d: pd.Timestamp(d.time_msc, unit="ms", tz="UTC")   # server time, like bars
+        filled = {f["ticket"] for f in jread("fill")}
+        for p in mt5c.positions(mt5, self.symbol):
+            if p.magic == mt5c.MAGIC and p.ticket not in filled:
+                jwrite("fill", {"ts": at(p), "ticket": p.ticket, "price": p.price_open,
+                                "lots": p.volume})
+                self.tg("fill", f"FILLED {self.symbol} {p.volume} @ {p.price_open}")
+
+        done = {t.get("ticket") for t in trades() if t.get("mode") == "live"}
+        places = {p["ticket"]: p for p in jread("place")}
+        signals = {s["ts"]: s for s in jread("signal")}
+        reasons = {mt5.DEAL_REASON_SL: "sl", mt5.DEAL_REASON_TP: "tp",
+                   mt5.DEAL_REASON_SO: "stop_out", mt5.DEAL_REASON_EXPERT: "bot"}
+        for pid, deals, order in mt5c.closed_positions(mt5, self.symbol):
+            if pid in done:
+                continue
+            ins = [d for d in deals if d.entry == mt5.DEAL_ENTRY_IN]
+            outs = [d for d in deals if d not in ins]
+            side = 1 if ins[0].type == mt5.DEAL_TYPE_BUY else -1
+            lots = sum(d.volume for d in ins)
+            entry = sum(d.price * d.volume for d in ins) / lots
+            exit_price = sum(d.price * d.volume for d in outs) / lots
+            place = places.get(pid, {})
+            # limit orders carry their price; market orders store 0.0
+            requested = (order.price_open if order else 0.0) or place.get("entry")
+            sl = order.sl if order else place.get("sl")
+            money = {k: sum(getattr(d, k) for d in deals)
+                     for k in ("profit", "commission", "swap", "fee")}
+            pnl = sum(money.values())
+            sig = {k: v for k, v in signals.get(place.get("ts"), {}).items()
+                   if k not in ("kind", "ts")}
+            rec = {**sig, "signal_ts": place.get("ts"), "ticket": pid, "side": side,
+                   "opened": at(ins[0]), "closed": at(outs[-1]),
+                   "requested_entry": requested, "entry": entry,
+                   "slippage": (entry - requested) * side if requested else None,  # + = worse
+                   "sl": sl, "tp": order.tp if order else place.get("tp"),
+                   "lots": lots, "exit_price": exit_price,
+                   "r_multiple": (exit_price - entry) * side / abs(entry - sl) if sl else None,
+                   **money, "pnl": pnl,
+                   "reason": reasons.get(outs[-1].reason, "manual"),
+                   "mt5_comment": outs[-1].comment,
+                   "deals": [d.ticket for d in deals], "mode": "live"}
+            twrite(rec)
+            jwrite("close", {"ts": rec["closed"], "ticket": pid, "equity": equity, "pnl": pnl})
+            self.tg("close", f"position closed ({rec['reason']}), pnl {pnl:.2f}, "
+                             f"equity {equity:.0f}")
 
     def record_dry_exit(self, ev, win) -> None:
         pnl = ev["side"] * (ev["price"] - ev["entry"]) * ev["qty"] \
