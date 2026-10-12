@@ -10,13 +10,15 @@ Usage (from the project root, gold-pa/):
   python -m goldpa.backtest [data_dir] --split   # disjoint time windows
   python -m goldpa.backtest [data_dir] --wf      # walk-forward optimization
   python -m goldpa.backtest [data_dir] --mc      # Monte Carlo drawdown bootstrap
-  add --friday=H to any of the above: Friday flat from hour H in the data's clock
+  add --friday=H to any of the above: Friday + pre-holiday flat from hour H, data's clock
                                       (Dukascopy = UTC; FTMO MT5 bars = server time)
 """
 import sys
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
+from dateutil.easter import easter
 
 from . import data
 from . import pa
@@ -31,16 +33,42 @@ CAPITAL = 10_000.0
 BARS_PER_YEAR = 24_192  # ponytail: 4*24*252, ignores weekends; fine for ranking
 
 
+def market_closed(d: date) -> bool:
+    """Full-day XAUUSD closures, matching every one in FTMO's 2018-2026 history:
+    Good Friday, Christmas, New Year. A Sunday holiday closes Monday; Christmas
+    on a Saturday closes Friday (New Year on a Saturday closes nothing)."""
+    if d == easter(d.year) - timedelta(days=2):
+        return True
+    for h in (date(d.year, 12, 25), date(d.year, 1, 1)):
+        if h.weekday() == 6:
+            h += timedelta(days=1)
+        elif h.weekday() == 5:
+            h = h - timedelta(days=1) if h.month == 12 else None
+        if d == h:
+            return True
+    return False
+
+
+def flat_now(ts, hour: int) -> bool:
+    """Weekend/holiday flat (shared with runner.blocked): from `hour`, in the
+    bars' own clock, on a Friday or on the last trading day before a full-day
+    closure (e.g. the Thursday before Good Friday)."""
+    if ts.hour < hour:
+        return False
+    d = ts.date()
+    return d.weekday() == 4 or (d.weekday() < 4 and market_closed(d + timedelta(days=1)))
+
+
 def commission_of(pos: dict) -> float:
     return (COMMISSION_PCT * pos["entry"] + COMMISSION) * pos["qty"]
 
 
 def run(m15: pd.DataFrame, h4: pd.DataFrame, trade_from=None, p: P | None = None,
         cache: dict | None = None, friday_flat: int | None = None) -> dict:
-    """friday_flat: hour, in the DATA's own clock, from which Friday is flat —
-    cancel pending, close the position at bar close, no new entries (mirrors
-    runner.blocked()). None = off: the default for the live warmup replay,
-    WFO and the dry self-check, so their results are unchanged."""
+    """friday_flat: hour, in the DATA's own clock, from which Fridays (and days
+    before a holiday closure, see flat_now) are flat — cancel pending, close the
+    position at bar close, no new entries (mirrors runner.blocked()). None = off:
+    the default for WFO and the dry self-check, so their results are unchanged."""
     p = p or P()
     if cache is None:
         cache = precompute(m15, h4)
@@ -67,7 +95,7 @@ def run(m15: pd.DataFrame, h4: pd.DataFrame, trade_from=None, p: P | None = None
         act = st.advance(i, bar, evs, flat=sb.pos is None)
 
         ts = m15.index[i]
-        blocked = friday_flat is not None and ts.weekday() == 4 and ts.hour >= friday_flat
+        blocked = friday_flat is not None and flat_now(ts, friday_flat)
         if blocked:
             sb.cancel_pending()
             for ev in sb.force_close(i, float(bar["close"])):

@@ -29,6 +29,7 @@ import pandas as pd
 from . import data
 from . import mt5_client as mt5c
 from . import notify
+from .backtest import flat_now
 from .simbroker import SimBroker
 from .strategy import Params, StrategyState, pool_target, precompute
 
@@ -40,11 +41,12 @@ WARMUP = 3000          # M15 bars fetched per cycle (~31 days) — state rebuild
 RISK = 0.003           # 0.3% per trade — FTMO-fit (MC worst-5% DD -9% < 10% rule)
 MAX_DAILY_LOSS = 0.02  # self-limit, half of FTMO's 5%
 MAX_TOTAL_DD = 0.06    # self-limit from challenge-start equity, vs FTMO 10%
-# Friday hour after which everything is flattened, in BAR time. Live bars are
-# FTMO server time (UTC+2 winter / UTC+3 summer), so 22 = 20:00 UTC winter,
-# 19:00 UTC summer (PLAN: ~20:00 UTC). On UTC data (--dry/--replay on
-# Dukascopy) 22 falls after gold's close, so it never fires there.
-FRIDAY_FLAT_HOUR = 22
+# Hour, in BAR time, from which Fridays and pre-holiday days are flat (see
+# backtest.flat_now). Live bars are FTMO server time (UTC+2 winter / UTC+3
+# summer): 19 = 17:00 / 16:00 UTC — before the earliest early close seen
+# (19:45 server: Thanksgiving Friday, July 4, Juneteenth). Backtest on FTMO
+# 2021-2026: same result as 22 (+619.6R vs +617.4R), no calendar of early closes needed.
+FRIDAY_FLAT_HOUR = 19
 PAPER_START = 10_000.0             # dry-run starting equity
 PAPER_COMMISSION_PCT = 0.000014    # dry-run round-turn commission, FTMO metals style
 
@@ -147,9 +149,9 @@ class Runner:
             self.br_flatten(ts, "STOP file")
             self.tg("stop", "STOP file present — flattened, entries halted", once=True)
             return True
-        if ts.weekday() == 4 and ts.hour >= FRIDAY_FLAT_HOUR:
-            self.br_flatten(ts, "Friday flat")
-            self.tg("friday", "Friday flat — weekend gap protection", once=True)
+        if flat_now(ts, FRIDAY_FLAT_HOUR):
+            self.br_flatten(ts, "weekend/holiday flat")
+            self.tg("friday", "Weekend/holiday flat — gap protection", once=True)
             return True
         if equity <= day_start * (1 - MAX_DAILY_LOSS):
             self.br_flatten(ts, "daily loss")
@@ -390,8 +392,9 @@ def run_cycle(r: Runner) -> None:
     st = StrategyState(r.params, cache, win)
 
     # warmup replay through the SAME backtest loop -> adopt its end state
+    # (with weekend/holiday flat, so the replay blocks the same bars live blocked)
     from . import backtest
-    res = backtest.run(win, h4, p=r.params, cache=cache)
+    res = backtest.run(win, h4, p=r.params, cache=cache, friday_flat=FRIDAY_FLAT_HOUR)
     st.setup, st.working = res["state"].setup, res["state"].working
 
     # resync against broker truth
