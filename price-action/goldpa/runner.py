@@ -66,6 +66,22 @@ def jwrite(kind: str, rec: dict) -> None:
         json.dumps({"kind": kind, **rec}, default=str) + "\n")
 
 
+def jread(kind: str) -> list:
+    """All journal records of one kind, in file order."""
+    f = JOURNAL / "runner.jsonl"
+    if not f.exists():
+        return []
+    out = []
+    for line in f.read_text().splitlines():
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("kind") == kind:
+            out.append(rec)
+    return out
+
+
 def twrite(rec: dict) -> None:
     """One complete record per closed trade."""
     JOURNAL.mkdir(exist_ok=True)
@@ -98,10 +114,16 @@ class Runner:
 
     # ---------- journal / telegram ----------
     def tg(self, key: str, text: str, once: bool = False) -> None:
-        if once and self.told.get(key):
-            return
-        self.told[key] = True
-        jwrite("tg", {"key": key, "text": text})
+        # once = once per key per bar-day. --once starts a fresh process every
+        # bar, so the in-memory guard is backed by the journal (not in dry:
+        # its journal holds earlier dry runs over the same dates).
+        day = str(self.ctx[0].index[self.ctx[1]].date()) if self.ctx else None
+        if once:
+            if self.told.get((key, day)) or (self.mode != "dry" and any(
+                    t["key"] == key and t.get("day") == day for t in jread("tg"))):
+                return
+            self.told[(key, day)] = True
+        jwrite("tg", {"key": key, "text": text, "day": day})
         notify.send(self.cfg, f"[price-action] {text}")
 
     # ---------- data ----------
@@ -299,18 +321,9 @@ class Runner:
             if self.cur_day != ts.date():
                 self.cur_day, self.day_start = ts.date(), equity
             return self.day_start, self.start_equity
-        recs = JOURNAL / "runner.jsonl"
-        day_s = start_s = None
-        if recs.exists():
-            for line in recs.read_text().splitlines():
-                try:
-                    r = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if r.get("kind") == "day":
-                    if r["ts"][:10] == str(ts.date()):
-                        day_s = r["equity"]
-                    start_s = r["equity"]
+        days = jread("day")
+        start_s = days[0]["equity"] if days else None   # FIRST day = challenge start
+        day_s = next((r["equity"] for r in days if r["ts"][:10] == str(ts.date())), None)
         if day_s is None:
             jwrite("day", {"ts": ts, "equity": equity})
             day_s = equity
@@ -319,6 +332,18 @@ class Runner:
 
 def run_cycle(r: Runner) -> None:
     win = r.window()
+    i = len(win) - 2                      # last CLOSED bar (row -1 is forming)
+
+    # never act on a bar that isn't newer than the last one processed:
+    # weekend/market closed, or MT5 serving stale history right after startup
+    if r.mt5:
+        seen = [pd.Timestamp(h["ts"]) for h in jread("heartbeat")
+                if h.get("mode") in ("once", "loop")]
+        if seen and win.index[i] <= max(seen):
+            jwrite("warn", {"ts": win.index[i], "why": "bar not newer than last processed "
+                            f"({max(seen)}) — skipped"})
+            return
+
     h4 = data.resample_h4(win)
     cache = precompute(win, h4)
     st = StrategyState(r.params, cache, win)
@@ -339,7 +364,6 @@ def run_cycle(r: Runner) -> None:
         if r.pos_ticket is None and mt5c.positions(r.mt5, r.symbol):
             r.pos_ticket = mt5c.positions(r.mt5, r.symbol)[0].ticket
 
-    i = len(win) - 2                      # last CLOSED bar (row -1 is forming)
     r.process(i, win, st, cache)
 
 
