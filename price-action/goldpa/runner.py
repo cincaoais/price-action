@@ -392,9 +392,11 @@ def run_cycle(r: Runner) -> None:
     st = StrategyState(r.params, cache, win)
 
     # warmup replay through the SAME backtest loop -> adopt its end state
-    # (with weekend/holiday flat, so the replay blocks the same bars live blocked)
+    # (with weekend/holiday flat, so the replay blocks the same bars live blocked).
+    # Replay only the bars BEFORE bar i: replaying bar i itself consumed its
+    # "place" action inside the replay, so process(i) could never place an order.
     from . import backtest
-    res = backtest.run(win, h4, p=r.params, cache=cache, friday_flat=FRIDAY_FLAT_HOUR)
+    res = backtest.run(win.iloc[:i], h4, p=r.params, cache=cache, friday_flat=FRIDAY_FLAT_HOUR)
     st.setup, st.working = res["state"].setup, res["state"].working
 
     # resync against broker truth
