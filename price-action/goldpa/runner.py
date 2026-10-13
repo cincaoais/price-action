@@ -22,6 +22,7 @@ Usage (from the project root):
 import json
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import pandas as pd
@@ -92,6 +93,18 @@ def twrite(rec: dict) -> None:
     """One complete record per closed trade."""
     JOURNAL.mkdir(exist_ok=True)
     (JOURNAL / "trades.jsonl").open("a").write(json.dumps(rec, default=str) + "\n")
+
+
+def jerror(e: Exception) -> None:
+    """Crash record. --once runs under pythonw (no console), so without this
+    a failed cycle leaves no trace at all. `at` is wall-clock UTC, not bar time."""
+    try:
+        import MetaTrader5
+        last = MetaTrader5.last_error()
+    except Exception:
+        last = None
+    jwrite("error", {"at": pd.Timestamp.now(tz="UTC"), "error": repr(e),
+                     "mt5_last_error": last, "trace": traceback.format_exc()})
 
 
 class Runner:
@@ -624,6 +637,7 @@ def main() -> None:
             try:
                 paper_cycle(r)
             except Exception as e:
+                jerror(e)
                 r.tg("error", f"paper cycle error: {e!r}")
                 print(f"paper cycle error: {e!r}", flush=True)
         return
@@ -639,9 +653,14 @@ def main() -> None:
         try:
             run_cycle(r)
         except Exception as e:
+            jerror(e)
             r.tg("error", f"cycle error: {e!r}")
             print(f"cycle error: {e!r}", flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        jerror(e)
+        raise
