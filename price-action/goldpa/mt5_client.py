@@ -82,7 +82,7 @@ def place_limit(mt5, symbol: str, sp: dict, side: int, entry: float, sl: float,
         "price": round(entry, d), "sl": round(sl, d), "tp": round(tp, d),
         "type_time": mt5f.ORDER_TIME_GTC,
         "type_filling": sp["filling"],
-        "magic": MAGIC, "comment": comment[:31],
+        "magic": MAGIC, "comment": comment[:26],   # MT5 python rejects > 29 chars ("Invalid comment argument")
     }
     res = mt5.order_send(req)
     if res is None or res.retcode != mt5f.TRADE_RETCODE_DONE:
